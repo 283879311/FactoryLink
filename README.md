@@ -377,6 +377,168 @@ FactoryLink/
 └── README.md                # 本文件
 ```
 
+## 架构说明与 EXE 打包机制
+
+### 整体架构
+
+FactoryLink 是面向工业现场的单机边缘数据采集网关，采用“Vue 单页应用 + FastAPI 单体后端 + 协议采集器插件 + MQTT 转发”的架构。前端负责设备、点位和系统配置；后端直接与 PLC 通信，将采集结果通过 WebSocket 推送到浏览器，并按设备转发至 MQTT。
+
+```text
+Vue 3 + Vite + Element Plus SPA
+  ├─ REST API：配置、设备、采集控制、日志、Excel、AI
+  ├─ WebSocket：实时数据与设备状态
+  └─ SSE：AI 配置助手流式结果
+                 │
+                 ▼
+FastAPI（backend/main.py）
+  ├─ 配置管理：config.json / config.json.bak
+  ├─ 采集调度：采集器生命周期、设备状态、WebSocket 广播
+  ├─ MQTT 转发：数据主题与状态主题
+  ├─ 运维能力：日志、Excel 导入、连接测试、系统托盘
+  └─ AI 服务：OpenAI 兼容接口
+                 │
+                 ▼
+BaseCollector 抽象层
+  ├─ Modbus TCP / RTU
+  ├─ Siemens S7
+  └─ Mitsubishi MC
+```
+
+#### 前端层
+
+- Vue 3 SPA 提供首页、设备配置和系统设置三个页面；开发环境由 Vite 将 `/api` 与 `/ws` 代理到本地后端，生产环境由 FastAPI 直接托管构建产物。
+- 首页使用 REST 获取设备和运行状态，使用 WebSocket 接收实时点位和状态变化；AI 配置助手使用 SSE 接收模型的流式输出。
+
+#### 后端与采集层
+
+- `backend/main.py` 是应用组合入口，负责 FastAPI、REST API、WebSocket、采集调度、系统托盘、端口检测及静态文件服务。
+- `BaseCollector` 定义连接、断开和单点读取等统一协议接口，并集中提供状态通知、指数退避和统一数据封装；新协议可通过新增 collector 子类并在采集器工厂中登记来扩展。
+- Modbus、S7 和 Mitsubishi 采集器分别完成设备连接、地址解析、字节序/数据类型解码，以及倍率和偏移量处理。
+
+#### 基础设施层
+
+- 配置以 JSON 文件保存，每次保存前自动生成 `config.json.bak`；日志采用 10 MB × 5 份的轮转文件策略。
+- MQTT 按 `{topic_prefix}/{device_id}` 发布采集数据，并按 `{topic_prefix}/{device_id}/status` 发布设备状态。
+
+### 架构优点
+
+1. **便于现场交付。** 单体程序把浏览器 UI、后端 API 和工业协议通信整合到一个部署单元，适合设备量有限、工程师需要快速安装和排障的车间场景。
+2. **协议扩展边界清晰。** 公共连接、重连、状态和数据结构逻辑位于 `BaseCollector`，协议实现只需关注通信与解析逻辑。
+3. **实时链路完整。** PLC 数据可同时进入 WebSocket 和 MQTT，既满足本地实时查看，也满足上游平台订阅。
+4. **运维友好。** 提供配置备份、日志查看、Excel 点表导入、连通性测试、热应用配置和系统托盘等现场工具。
+
+### 当前限制与改进方向
+
+1. **优先修复断线重连控制流。** 采集循环当前会跳过未连接的采集器；应确保断线设备仍能触发后台重连，或将重连提升到独立设备 worker。
+2. **采集是单线程串行的。** 一台 PLC 的慢响应会拖慢其他设备，且大量点位会产生大量单点请求。建议按设备隔离采集任务，并对连续地址实施批量读取。
+3. **启停操作需状态机化。** 当前启停和应用配置使用后台线程，建议用 `stopped / starting / running / stopping / failed` 状态机及单一控制队列避免并发竞争。
+4. **MQTT 可靠性仍可增强。** 建议增加连接/断连回调、退避重连、Last Will、发布结果检查及按需的本地离线队列。
+5. **配置安全与校验需要加强。** MQTT 密码和 AI Key 当前保存在本地配置中；正式部署应对接口输出做脱敏，并考虑系统凭据库或 Docker Secret。协议、端口、地址和采集周期也应在保存前做更严格的结构化校验。
+6. **补充自动化测试。** 建议优先覆盖地址解析、字节序解码、倍率偏移、重连状态机、配置备份和 FastAPI API 契约，再增加模拟 PLC/MQTT 的集成测试。
+
+### 与 Fledge 的对比与可借鉴方向
+
+[Fledge](https://github.com/fledge-iot/fledge) 是更偏向通用工业/物联网边缘平台的开源项目：它以服务和插件为主要扩展单元，将南向采集、过滤/处理、北向发送、通知和持久化能力解耦。FactoryLink 则以“Windows 单 EXE、浏览器配置、快速采集 PLC 并转发 MQTT”为重点。两者目标不同：FactoryLink 不应直接照搬 Fledge 的部署复杂度，但很值得吸收其稳定的扩展边界和运行治理思路。
+
+| 维度 | FactoryLink 当前方式 | Fledge 可借鉴的思路 | 建议的调整 |
+|------|---------------------|---------------------|------------|
+| 产品定位 | 单机、单体、快速交付，优先服务 Windows 现场工程师。 | 面向长期运行、异构设备和多种北向系统的边缘平台。 | 保留单 EXE 产品形态；不要为了“微服务化”牺牲安装体验。 |
+| 南向协议 | 以 `BaseCollector` 加三个协议实现扩展，采集器由主进程直接管理。 | 通过明确的南向插件契约接入协议和设备。 | 将 collector 工厂改为可注册的插件注册表；为协议实现定义能力、配置 schema、连接/健康检查和版本信息。 |
+| 数据处理 | 读取后直接推送 WebSocket 和 MQTT，只有倍率/偏移等点位转换。 | 将采集、过滤/转换、北向发送拆为可组合的数据管道。 | 先在进程内增加轻量 pipeline：`采集 → 标准化 → 过滤/聚合/告警 → 输出`；不必立即拆成独立进程。 |
+| 北向输出 | MQTT 写在单例 `MqttForwarder` 中。 | 北向连接器可按目标系统独立扩展与配置。 | 抽象 `Forwarder` 接口，保留 MQTT 默认实现；后续可增加 HTTP、OPC UA、数据库或其他工业平台适配器。 |
+| 可靠性 | 单采集线程串行读取；断线和消息丢失的处理能力有限。 | 服务级健康检查、独立生命周期、持久化和失败隔离。 | 为每台设备建立独立 worker 与健康状态；加入输出队列、限流、失败重试、死信/落盘策略，并暴露运行指标。 |
+| 运维与配置 | 本地 JSON 文件、日志文件和 Web UI。 | 统一配置、审计、服务状态和插件生命周期管理。 | 为配置加版本号与迁移机制；记录配置变更审计；在 UI 和 API 中展示设备最后成功时间、失败次数、读取耗时和队列积压。 |
+
+#### 推荐演进顺序
+
+1. **先修正运行可靠性，而不是拆服务。** 修复断线重连路径、按设备隔离采集任务、避免在锁内进行网络 I/O，并补充单元/集成测试。
+2. **再抽象稳定接口。** 定义 `Collector`、`Processor`、`Forwarder` 三类内部接口；现有 Modbus/S7/Mitsubishi 和 MQTT 实现分别迁移到这些接口之后。这样可以获得 Fledge 式的可扩展性，同时仍保持单 EXE 部署。
+3. **引入轻量的进程内管道。** 先支持点位过滤、死区、数据转换、聚合和简单规则告警；该阶段不要求插件进程或外部服务。
+4. **最后才考虑可选插件包或多进程隔离。** 仅在需要第三方协议插件、设备数量明显增长、单个协议库不稳定，或需要隔离不同客户扩展时，再引入 Fledge 风格的独立插件进程和服务管理。
+
+#### 不建议直接照搬的部分
+
+- 不建议立即将当前应用拆成多个常驻服务或要求 Docker/容器编排；这会直接削弱 FactoryLink 的“下载后双击即可运行”优势。
+- 不建议一开始就实现通用插件市场、复杂资产模型或全量时序数据库。应以现场真实需求驱动：优先保证采集不中断、数据可追溯、故障可定位。
+- 不建议将 Fledge 当作“替代库”嵌入本项目；更合适的关系是把它作为架构参考，选择性借鉴其插件边界、数据管道和运行治理理念。
+
+### 如何生成 Windows EXE
+
+项目通过“先构建前端，再由 PyInstaller 打包 Python 后端和前端资源”的方式生成单文件 EXE：
+
+```text
+Vue 源码 --npm run build--> frontend/dist
+                                │
+Python 后端 + 第三方依赖 + frontend/dist
+                                │
+                         PyInstaller
+                                │
+                                ▼
+                 dist/工业数据采集网关.exe
+```
+
+#### 构建步骤
+
+应在 Windows 环境中完成构建：
+
+```bat
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+pip install pyinstaller
+build.bat
+```
+
+`build.bat` 会自动执行 `npm install` 和 `npm run build`，随后调用：
+
+```bat
+pyinstaller --onefile --windowed ^
+    --add-data "frontend/dist;frontend/dist" ^
+    --collect-all fastapi ^
+    --collect-all uvicorn ^
+    --collect-all pymodbus ^
+    --collect-all paho.mqtt.client ^
+    --collect-all websockets ^
+    --collect-all pystray ^
+    --collect-all httpx ^
+    --collect-all openpyxl ^
+    --collect-all python_multipart ^
+    --hidden-import snap7 ^
+    --hidden-import pymcprotocol ^
+    --name "工业数据采集网关" ^
+    --icon "icon.ico" ^
+    backend/main.py
+```
+
+参数说明：
+
+| 参数 | 作用 |
+|------|------|
+| `--onefile` | 生成单个 EXE 文件。 |
+| `--windowed` | 以 Windows GUI 模式启动，不显示传统控制台窗口。 |
+| `--add-data "frontend/dist;frontend/dist"` | 将 Vue 构建后的静态资源嵌入 EXE。 |
+| `--collect-all` | 收集 FastAPI、Uvicorn、协议库等包的模块和资源，避免动态导入造成运行时缺包。 |
+| `--hidden-import` | 强制包含 PyInstaller 静态分析可能遗漏的 S7、Mitsubishi 协议库。 |
+| `--name` / `--icon` | 设置 EXE 文件名和 Windows 图标。 |
+
+#### 双击 EXE 后的运行过程
+
+1. PyInstaller 启动内置 Python 运行环境，并在临时目录中释放打包资源。
+2. 程序执行 `backend/main.py` 的 `main()`：查找可用端口、创建系统托盘，并启动浏览器。
+3. Uvicorn 在 `127.0.0.1` 启动 FastAPI 服务；若 8000 被占用，会自动尝试后续端口。
+4. FastAPI 从 PyInstaller 的临时资源目录读取内置的 `frontend/dist`，向浏览器提供页面和 API。
+5. 浏览器访问 `http://localhost:<port>`，页面再通过 REST、WebSocket 和 SSE 与本机服务交互。
+
+因此，这个 EXE 的主界面本质上是“本机 FastAPI 服务 + 默认浏览器中的 Vue 页面”，而 Windows 原生界面部分主要是系统托盘菜单。
+
+#### 运行时文件位置与注意事项
+
+- 前端静态资源在单文件 EXE 启动时释放到 PyInstaller 临时目录；程序通过 `sys._MEIPASS` 定位这些资源。
+- `config.json`、`config.json.bak` 和 `logs/gateway.log` 不写在临时目录，而是写在 EXE 所在目录，确保重启后配置和日志仍保留。
+- 发布目录必须具有写权限；不建议直接放在受 UAC 保护的 `Program Files` 中。
+- 单文件模式首次启动需要解压资源，启动时间通常会略长；未签名的 PyInstaller 程序也可能触发 Windows 安全软件告警，正式分发建议进行代码签名。
+- README 中曾写出 `dist/FactoryLink.exe`，但实际 `build.bat` 配置的输出名是 `dist/工业数据采集网关.exe`，应以脚本为准。
+
 ## 常见问题
 
 **Q: 双击EXE没反应？**
