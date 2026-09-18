@@ -377,6 +377,142 @@ FactoryLink/
 └── README.md                # 本文件
 ```
 
+## 架构说明与 EXE 打包机制
+
+### 整体架构
+
+FactoryLink 是面向工业现场的单机边缘数据采集网关，采用“Vue 单页应用 + FastAPI 单体后端 + 协议采集器插件 + MQTT 转发”的架构。前端负责设备、点位和系统配置；后端直接与 PLC 通信，将采集结果通过 WebSocket 推送到浏览器，并按设备转发至 MQTT。
+
+```text
+Vue 3 + Vite + Element Plus SPA
+  ├─ REST API：配置、设备、采集控制、日志、Excel、AI
+  ├─ WebSocket：实时数据与设备状态
+  └─ SSE：AI 配置助手流式结果
+                 │
+                 ▼
+FastAPI（backend/main.py）
+  ├─ 配置管理：config.json / config.json.bak
+  ├─ 采集调度：采集器生命周期、设备状态、WebSocket 广播
+  ├─ MQTT 转发：数据主题与状态主题
+  ├─ 运维能力：日志、Excel 导入、连接测试、系统托盘
+  └─ AI 服务：OpenAI 兼容接口
+                 │
+                 ▼
+BaseCollector 抽象层
+  ├─ Modbus TCP / RTU
+  ├─ Siemens S7
+  └─ Mitsubishi MC
+```
+
+#### 前端层
+
+- Vue 3 SPA 提供首页、设备配置和系统设置三个页面；开发环境由 Vite 将 `/api` 与 `/ws` 代理到本地后端，生产环境由 FastAPI 直接托管构建产物。
+- 首页使用 REST 获取设备和运行状态，使用 WebSocket 接收实时点位和状态变化；AI 配置助手使用 SSE 接收模型的流式输出。
+
+#### 后端与采集层
+
+- `backend/main.py` 是应用组合入口，负责 FastAPI、REST API、WebSocket、采集调度、系统托盘、端口检测及静态文件服务。
+- `BaseCollector` 定义连接、断开和单点读取等统一协议接口，并集中提供状态通知、指数退避和统一数据封装；新协议可通过新增 collector 子类并在采集器工厂中登记来扩展。
+- Modbus、S7 和 Mitsubishi 采集器分别完成设备连接、地址解析、字节序/数据类型解码，以及倍率和偏移量处理。
+
+#### 基础设施层
+
+- 配置以 JSON 文件保存，每次保存前自动生成 `config.json.bak`；日志采用 10 MB × 5 份的轮转文件策略。
+- MQTT 按 `{topic_prefix}/{device_id}` 发布采集数据，并按 `{topic_prefix}/{device_id}/status` 发布设备状态。
+
+### 架构优点
+
+1. **便于现场交付。** 单体程序把浏览器 UI、后端 API 和工业协议通信整合到一个部署单元，适合设备量有限、工程师需要快速安装和排障的车间场景。
+2. **协议扩展边界清晰。** 公共连接、重连、状态和数据结构逻辑位于 `BaseCollector`，协议实现只需关注通信与解析逻辑。
+3. **实时链路完整。** PLC 数据可同时进入 WebSocket 和 MQTT，既满足本地实时查看，也满足上游平台订阅。
+4. **运维友好。** 提供配置备份、日志查看、Excel 点表导入、连通性测试、热应用配置和系统托盘等现场工具。
+
+### 当前限制与改进方向
+
+1. **优先修复断线重连控制流。** 采集循环当前会跳过未连接的采集器；应确保断线设备仍能触发后台重连，或将重连提升到独立设备 worker。
+2. **采集是单线程串行的。** 一台 PLC 的慢响应会拖慢其他设备，且大量点位会产生大量单点请求。建议按设备隔离采集任务，并对连续地址实施批量读取。
+3. **启停操作需状态机化。** 当前启停和应用配置使用后台线程，建议用 `stopped / starting / running / stopping / failed` 状态机及单一控制队列避免并发竞争。
+4. **MQTT 可靠性仍可增强。** 建议增加连接/断连回调、退避重连、Last Will、发布结果检查及按需的本地离线队列。
+5. **配置安全与校验需要加强。** MQTT 密码和 AI Key 当前保存在本地配置中；正式部署应对接口输出做脱敏，并考虑系统凭据库或 Docker Secret。协议、端口、地址和采集周期也应在保存前做更严格的结构化校验。
+6. **补充自动化测试。** 建议优先覆盖地址解析、字节序解码、倍率偏移、重连状态机、配置备份和 FastAPI API 契约，再增加模拟 PLC/MQTT 的集成测试。
+
+### 如何生成 Windows EXE
+
+项目通过“先构建前端，再由 PyInstaller 打包 Python 后端和前端资源”的方式生成单文件 EXE：
+
+```text
+Vue 源码 --npm run build--> frontend/dist
+                                │
+Python 后端 + 第三方依赖 + frontend/dist
+                                │
+                         PyInstaller
+                                │
+                                ▼
+                 dist/工业数据采集网关.exe
+```
+
+#### 构建步骤
+
+应在 Windows 环境中完成构建：
+
+```bat
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+pip install pyinstaller
+build.bat
+```
+
+`build.bat` 会自动执行 `npm install` 和 `npm run build`，随后调用：
+
+```bat
+pyinstaller --onefile --windowed ^
+    --add-data "frontend/dist;frontend/dist" ^
+    --collect-all fastapi ^
+    --collect-all uvicorn ^
+    --collect-all pymodbus ^
+    --collect-all paho.mqtt.client ^
+    --collect-all websockets ^
+    --collect-all pystray ^
+    --collect-all httpx ^
+    --collect-all openpyxl ^
+    --collect-all python_multipart ^
+    --hidden-import snap7 ^
+    --hidden-import pymcprotocol ^
+    --name "工业数据采集网关" ^
+    --icon "icon.ico" ^
+    backend/main.py
+```
+
+参数说明：
+
+| 参数 | 作用 |
+|------|------|
+| `--onefile` | 生成单个 EXE 文件。 |
+| `--windowed` | 以 Windows GUI 模式启动，不显示传统控制台窗口。 |
+| `--add-data "frontend/dist;frontend/dist"` | 将 Vue 构建后的静态资源嵌入 EXE。 |
+| `--collect-all` | 收集 FastAPI、Uvicorn、协议库等包的模块和资源，避免动态导入造成运行时缺包。 |
+| `--hidden-import` | 强制包含 PyInstaller 静态分析可能遗漏的 S7、Mitsubishi 协议库。 |
+| `--name` / `--icon` | 设置 EXE 文件名和 Windows 图标。 |
+
+#### 双击 EXE 后的运行过程
+
+1. PyInstaller 启动内置 Python 运行环境，并在临时目录中释放打包资源。
+2. 程序执行 `backend/main.py` 的 `main()`：查找可用端口、创建系统托盘，并启动浏览器。
+3. Uvicorn 在 `127.0.0.1` 启动 FastAPI 服务；若 8000 被占用，会自动尝试后续端口。
+4. FastAPI 从 PyInstaller 的临时资源目录读取内置的 `frontend/dist`，向浏览器提供页面和 API。
+5. 浏览器访问 `http://localhost:<port>`，页面再通过 REST、WebSocket 和 SSE 与本机服务交互。
+
+因此，这个 EXE 的主界面本质上是“本机 FastAPI 服务 + 默认浏览器中的 Vue 页面”，而 Windows 原生界面部分主要是系统托盘菜单。
+
+#### 运行时文件位置与注意事项
+
+- 前端静态资源在单文件 EXE 启动时释放到 PyInstaller 临时目录；程序通过 `sys._MEIPASS` 定位这些资源。
+- `config.json`、`config.json.bak` 和 `logs/gateway.log` 不写在临时目录，而是写在 EXE 所在目录，确保重启后配置和日志仍保留。
+- 发布目录必须具有写权限；不建议直接放在受 UAC 保护的 `Program Files` 中。
+- 单文件模式首次启动需要解压资源，启动时间通常会略长；未签名的 PyInstaller 程序也可能触发 Windows 安全软件告警，正式分发建议进行代码签名。
+- README 中曾写出 `dist/FactoryLink.exe`，但实际 `build.bat` 配置的输出名是 `dist/工业数据采集网关.exe`，应以脚本为准。
+
 ## 常见问题
 
 **Q: 双击EXE没反应？**
